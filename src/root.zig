@@ -12,29 +12,32 @@ pub const Click = struct {
     y: u64,
 };
 
-const live_cell: u8 = 1;
-const dead_cell: u8 = 0;
-const title_rows: u64 = 2;
-const stats_rows: u64 = 1;
-const board_origin_col: u64 = 1; // terminal coordinates are 1-based
-const board_origin_row: u64 = title_rows + 1;
+const live_cell: u8 = ' ';
+const dead_cell: u8 = '@';
+const non_game_board_rows: u64 = 3; // 2 for title and instructions, 1 for stats on the bottom
+var height_and_width: u64 = 0;
+var board_origin_col: u64 = 2;
+var board_origin_row: u64 = 0;
 
+var quit_requested: bool = false;
 var frame_count: u64 = 0;
 var game_start_ns: ?i128 = null;
 var original_termios: ?posix.termios = null;
-var quit_requested = false;
+
+const RuntimeError = error{TerminalTooSmall};
 
 /// Find the largest square game board that will fit in the current terminal.
 /// One row above the board is reserved for the title and one row below is
 /// reserved for timing/FPS stats.
-pub fn determineGameBoardDimensions() GameBoardDimensions {
-    const size = terminalSize() catch TerminalSize{ .cols = 80, .rows = 25 };
-    const usable_rows = if (size.rows > title_rows + stats_rows)
-        size.rows - title_rows - stats_rows
-    else
-        1;
-    const side = @max(@as(u64, 1), @min(size.cols, usable_rows));
-    return .{ .x = side, .y = side };
+pub fn determineGameBoardDimensions(io: std.Io) RuntimeError!GameBoardDimensions {
+    const size = terminalSize(io);
+    if (size.rows <= non_game_board_rows) return RuntimeError.TerminalTooSmall;
+    const usable_rows = size.rows - non_game_board_rows;
+    height_and_width = @min(usable_rows, size.cols);
+    if (height_and_width < 10) {
+        return RuntimeError.TerminalTooSmall;
+    }
+    return .{ .x = height_and_width, .y = height_and_width };
 }
 
 /// Clear the terminal and write a title, the board, elapsed seconds, and the
@@ -43,7 +46,7 @@ pub fn determineGameBoardDimensions() GameBoardDimensions {
 /// `gameBoard` is intentionally `anytype` so callers can pass fixed-size Zig
 /// arrays such as `[height][width]u8` / `*[height][width]u8`. Cells with value
 /// 0 are drawn as spaces; all other values are drawn as `#`.
-pub fn writeFrame(gameBoard: anytype) void {
+pub fn writeFrame(io: std.Io, gameBoard: [][]u8) !void {
     const now = monotonicNanoTimestamp();
     if (game_start_ns == null) game_start_ns = now;
     frame_count += 1;
@@ -55,10 +58,19 @@ pub fn writeFrame(gameBoard: anytype) void {
     else
         0;
 
-    std.debug.print("\x1b[H\x1b[2JLife - click seed, q quit\n", .{});
-    writeBoard(gameBoard);
+    const stdout = std.Io.File.stdout();
+    var header_buffer: [128]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buffer, "\x1b[H\x1b[2JLife - click seed, q quit\n", .{});
+    try stdout.writeStreamingAll(io, header);
 
-    std.debug.print("elapsed: {d:.2}s  avg fps: {d:.2}\n", .{ elapsed_seconds, fps });
+    for (gameBoard) |row| {
+        try stdout.writeStreamingAll(io, row);
+        try stdout.writeStreamingAll(io, "\n");
+    }
+
+    var stats_buffer: [128]u8 = undefined;
+    const stats = try std.fmt.bufPrint(&stats_buffer, "elapsed: {d:.2}s  avg fps: {d:.2}\n", .{ elapsed_seconds, fps });
+    try stdout.writeStreamingAll(io, stats);
 }
 
 /// Check whether a mouse click was received inside the current game board.
@@ -91,19 +103,16 @@ pub fn checkForClick() !?Click {
     }
 
     if (parseMouseClick(buf[0..len])) |terminal_pos| {
-        const dims = determineGameBoardDimensions();
-        if (terminal_pos.col < board_origin_col or terminal_pos.row < board_origin_row) return null;
-
         const x = terminal_pos.col - board_origin_col;
         const y = terminal_pos.row - board_origin_row;
-        if (x < dims.x and y < dims.y) return .{ .x = x, .y = y };
+        return .{ .x = x, .y = y };
     }
 
     return null;
 }
 
 /// Put stdin into a cbreak-like mode and enable SGR mouse reporting.
-pub fn enableTerminalInput() !void {
+pub fn enableTerminalInput(io: std.Io) !void {
     if (original_termios == null) {
         original_termios = try posix.tcgetattr(posix.STDIN_FILENO);
         var raw = original_termios.?;
@@ -113,13 +122,14 @@ pub fn enableTerminalInput() !void {
         raw.cc[@intFromEnum(posix.V.TIME)] = 0;
         try posix.tcsetattr(posix.STDIN_FILENO, .NOW, raw);
     }
-
-    writeAllToStderr("\x1b[?1000h\x1b[?1006h");
+    try std.Io.File.stdout().writeStreamingAll(io, "\x1b[?1000h\x1b[?1006h");
 }
 
 /// Restore terminal input mode and disable mouse reporting.
-pub fn restoreTerminalInput() void {
-    writeAllToStderr("\x1b[?1006l\x1b[?1000l");
+pub fn restoreTerminalInput(io: std.Io) void {
+    std.Io.File.stdout().writeStreamingAll(io, "\x1b[?1006l\x1b[?1000l") catch |err| {
+        std.debug.print("Failed to write to std out! {s}", .{@errorName(err)});
+    };
     if (original_termios) |termios| {
         posix.tcsetattr(posix.STDIN_FILENO, .NOW, termios) catch {};
         original_termios = null;
@@ -143,14 +153,33 @@ fn monotonicNanoTimestamp() i128 {
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
-fn terminalSize() !TerminalSize {
-    if (builtin.os.tag == .windows) return error.Unsupported;
+/// returns x and y dimensions of stderr or returns x:50 y:50 on error
+/// no error value because 50x50 is pretty conservative
+fn terminalSize(io: std.Io) TerminalSize {
+    const file: std.Io.File = .stderr();
 
-    var ws: posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const rc = std.c.ioctl(posix.STDOUT_FILENO, posix.T.IOCGWINSZ, &ws);
-    if (rc != 0 or ws.row == 0 or ws.col == 0) return error.NotATerminal;
+    var winsize: posix.winsize = .{
+        .row = 0,
+        .col = 0,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
 
-    return .{ .cols = ws.col, .rows = ws.row };
+    const err = (io.operate(.{ .device_io_control = .{
+        .file = file,
+        .code = posix.T.IOCGWINSZ,
+        .arg = &winsize,
+    } }) catch {
+        std.log.debug("failed to determine terminal size; using conservative guess 50x50", .{});
+        return TerminalSize{ .rows = 50, .cols = 50 };
+    }).device_io_control;
+
+    if (err >= 0) {
+        return TerminalSize{ .rows = winsize.row, .cols = winsize.col };
+    } else {
+        std.log.debug("failed to determine terminal size; using conservative guess 80x25", .{});
+        return TerminalSize{ .rows = 50, .cols = 50 };
+    }
 }
 
 const TerminalPosition = struct { col: u64, row: u64 };
@@ -190,30 +219,6 @@ fn parseUnsigned(input: []const u8, index: *usize) ?u64 {
         value = value * 10 + (input[index.*] - '0');
     }
     return if (saw_digit) value else null;
-}
-
-fn writeBoard(gameBoard: anytype) void {
-    const T = @TypeOf(gameBoard);
-    switch (@typeInfo(T)) {
-        .pointer => |ptr| switch (ptr.size) {
-            .one => writeBoard(gameBoard.*),
-            .slice => for (gameBoard) |row| writeBoardRow(row),
-            else => @compileError("writeFrame expects a 2D u8 array or slice"),
-        },
-        .array => for (gameBoard) |row| writeBoardRow(row),
-        else => @compileError("writeFrame expects a 2D u8 array or slice"),
-    }
-}
-
-fn writeBoardRow(row: anytype) void {
-    for (row) |cell| {
-        std.debug.print("{c}", .{if (cell == 0) @as(u8, ' ') else @as(u8, '#')});
-    }
-    std.debug.print("\n", .{});
-}
-
-fn writeAllToStderr(bytes: []const u8) void {
-    std.debug.print("{s}", .{bytes});
 }
 
 pub fn updateClickedCell(click: Click, gameBoard: [][]u8) void {
@@ -279,7 +284,7 @@ fn countLiveCells(x: usize, y: usize, gameBoard: [][]u8) u64 {
 }
 
 test "determine dimensions returns a square" {
-    const dims = determineGameBoardDimensions();
+    const dims = try determineGameBoardDimensions(std.testing.io);
     try std.testing.expect(dims.x == dims.y);
     try std.testing.expect(dims.x > 0);
 }
@@ -290,12 +295,11 @@ test "parse SGR mouse click" {
     try std.testing.expectEqual(@as(u64, 7), pos.row);
 }
 
-test "writeFrame accepts a fixed 2D board" {
+test "writeFrame accepts row slices" {
     if (false) {
-        const board = [_][2]u8{
-            .{ 0, 1 },
-            .{ 1, 0 },
-        };
-        writeFrame(board);
+        var row_0 = [_]u8{ 0, 1 };
+        var row_1 = [_]u8{ 1, 0 };
+        var board = [_][]u8{ &row_0, &row_1 };
+        try writeFrame(std.testing.io, &board);
     }
 }
