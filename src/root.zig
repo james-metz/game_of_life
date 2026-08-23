@@ -12,12 +12,12 @@ pub const Click = struct {
     y: u64,
 };
 
-const live_cell: u8 = ' ';
-const dead_cell: u8 = '@';
+const live_cell: u8 = '#';
+const dead_cell: u8 = ' ';
 const non_game_board_rows: u64 = 3; // 2 for title and instructions, 1 for stats on the bottom
 var height_and_width: u64 = 0;
-var board_origin_col: u64 = 2;
-var board_origin_row: u64 = 0;
+var board_origin_col: u64 = 1; // used to offset mouse clicks - 1 based indexing for mouse clicks
+var board_origin_row: u64 = 2; // used to offset mouse clicks - 1 based indexing for mouse clicks and title row
 
 var quit_requested: bool = false;
 var frame_count: u64 = 0;
@@ -33,11 +33,16 @@ pub fn determineGameBoardDimensions(io: std.Io) RuntimeError!GameBoardDimensions
     const size = terminalSize(io);
     if (size.rows <= non_game_board_rows) return RuntimeError.TerminalTooSmall;
     const usable_rows = size.rows - non_game_board_rows;
-    height_and_width = @min(usable_rows, size.cols);
-    if (height_and_width < 10) {
+
+    if (usable_rows < 10 or size.cols < 10) {
         return RuntimeError.TerminalTooSmall;
     }
-    return .{ .x = height_and_width, .y = height_and_width };
+
+    if (usable_rows >= (2 * size.cols)) {
+        return .{ .x = size.cols, .y = size.cols / 2 };
+    } else {
+        return .{ .x = usable_rows, .y = usable_rows / 2 };
+    }
 }
 
 /// Clear the terminal and write a title, the board, elapsed seconds, and the
