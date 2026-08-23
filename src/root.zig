@@ -12,12 +12,12 @@ pub const Click = struct {
     y: u64,
 };
 
-const live_cell: u8 = '#';
+const live_cell: u8 = '@';
 const dead_cell: u8 = ' ';
 const non_game_board_rows: u64 = 3; // 2 for title and instructions, 1 for stats on the bottom
 var height_and_width: u64 = 0;
-var board_origin_col: u64 = 1; // used to offset mouse clicks - 1 based indexing for mouse clicks
-var board_origin_row: u64 = 2; // used to offset mouse clicks - 1 based indexing for mouse clicks and title row
+var board_origin_col: u64 = 2; // used to offset mouse clicks - 1 based indexing for mouse clicks
+var board_origin_row: u64 = 3; // used to offset mouse clicks - 1 based indexing for mouse clicks and title row
 
 var quit_requested: bool = false;
 var frame_count: u64 = 0;
@@ -63,19 +63,33 @@ pub fn writeFrame(io: std.Io, gameBoard: [][]u8) !void {
     else
         0;
 
-    const stdout = std.Io.File.stdout();
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    defer stdout_file.flush() catch {};
+    const stdout = &stdout_file.interface;
+
     var header_buffer: [128]u8 = undefined;
     const header = try std.fmt.bufPrint(&header_buffer, "\x1b[H\x1b[2JLife - click seed, q quit\n", .{});
-    try stdout.writeStreamingAll(io, header);
+    try stdout.writeAll(header);
+
+    const width = gameBoard[0].len;
+
+    try stdout.splatByteAll('-', width + 2);
+    try stdout.writeByte('\n');
 
     for (gameBoard) |row| {
-        try stdout.writeStreamingAll(io, row);
-        try stdout.writeStreamingAll(io, "\n");
+        try stdout.writeByte('|');
+        try stdout.writeAll(row);
+        try stdout.writeByte('|');
+        try stdout.writeByte('\n');
     }
+
+    try stdout.splatByteAll('-', width + 2);
+    try stdout.writeByte('\n');
 
     var stats_buffer: [128]u8 = undefined;
     const stats = try std.fmt.bufPrint(&stats_buffer, "elapsed: {d:.2}s  avg fps: {d:.2}\n", .{ elapsed_seconds, fps });
-    try stdout.writeStreamingAll(io, stats);
+    try stdout.writeAll(stats);
 }
 
 /// Check whether a mouse click was received inside the current game board.
@@ -288,9 +302,9 @@ fn countLiveCells(x: usize, y: usize, gameBoard: [][]u8) u64 {
     return live_cells;
 }
 
-test "determine dimensions returns a square" {
+test "determine dimensions returns a square (Assumes 2:1 aspect ratio of height to width)" {
     const dims = try determineGameBoardDimensions(std.testing.io);
-    try std.testing.expect(dims.x == dims.y);
+    try std.testing.expect(dims.x * 2 == dims.y);
     try std.testing.expect(dims.x > 0);
 }
 
