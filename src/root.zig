@@ -14,7 +14,7 @@ pub const Click = struct {
 
 const live_cell: u8 = '@';
 const dead_cell: u8 = ' ';
-const non_game_board_rows: u64 = 3; // 2 for title and instructions, 1 for stats on the bottom
+const non_game_board_rows: u64 = 5; // title, top border, bottom border, and stats row
 var height_and_width: u64 = 0;
 var board_origin_col: u64 = 2; // used to offset mouse clicks - 1 based indexing for mouse clicks
 var board_origin_row: u64 = 3; // used to offset mouse clicks - 1 based indexing for mouse clicks and title row
@@ -30,19 +30,21 @@ const RuntimeError = error{TerminalTooSmall};
 /// One row above the board is reserved for the title and one row below is
 /// reserved for timing/FPS stats.
 pub fn determineGameBoardDimensions(io: std.Io) RuntimeError!GameBoardDimensions {
-    const size = terminalSize(io);
-    if (size.rows <= non_game_board_rows) return RuntimeError.TerminalTooSmall;
+    return determineGameBoardDimensionsForTerminalSize(terminalSize(io));
+}
+
+fn determineGameBoardDimensionsForTerminalSize(size: TerminalSize) RuntimeError!GameBoardDimensions {
+    if (size.rows <= non_game_board_rows or size.cols <= 2) return RuntimeError.TerminalTooSmall;
+
     const usable_rows = size.rows - non_game_board_rows;
+    const usable_cols = size.cols - 2; // left/right board borders
 
-    if (usable_rows < 10 or size.cols < 10) {
-        return RuntimeError.TerminalTooSmall;
-    }
+    // Terminal cells are typically about twice as tall as they are wide, so a
+    // visually square board uses roughly two columns per row.
+    if (usable_rows < 10 or usable_cols < 20) return RuntimeError.TerminalTooSmall;
 
-    if (usable_rows >= (2 * size.cols)) {
-        return .{ .x = size.cols, .y = size.cols / 2 };
-    } else {
-        return .{ .x = usable_rows, .y = usable_rows / 2 };
-    }
+    const board_rows = @min(usable_rows, usable_cols / 2);
+    return .{ .x = board_rows * 2, .y = board_rows };
 }
 
 /// Clear the terminal and write a title, the board, elapsed seconds, and the
@@ -172,11 +174,19 @@ fn monotonicNanoTimestamp() i128 {
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
-/// returns x and y dimensions of stderr or returns x:50 y:50 on error
-/// no error value because 50x50 is pretty conservative
+/// Returns terminal dimensions, or a standard 80x25 fallback when no attached
+/// stream reports a usable terminal size.
 fn terminalSize(io: std.Io) TerminalSize {
-    const file: std.Io.File = .stderr();
+    const files = [_]std.Io.File{ .stderr(), .stdout(), .stdin() };
+    for (files) |file| {
+        if (terminalSizeForFile(io, file)) |size| return size;
+    }
 
+    std.log.debug("failed to determine terminal size; using fallback 80x25", .{});
+    return TerminalSize{ .rows = 25, .cols = 80 };
+}
+
+fn terminalSizeForFile(io: std.Io, file: std.Io.File) ?TerminalSize {
     var winsize: posix.winsize = .{
         .row = 0,
         .col = 0,
@@ -188,17 +198,10 @@ fn terminalSize(io: std.Io) TerminalSize {
         .file = file,
         .code = posix.T.IOCGWINSZ,
         .arg = &winsize,
-    } }) catch {
-        std.log.debug("failed to determine terminal size; using conservative guess 50x50", .{});
-        return TerminalSize{ .rows = 50, .cols = 50 };
-    }).device_io_control;
+    } }) catch return null).device_io_control;
 
-    if (err >= 0) {
-        return TerminalSize{ .rows = winsize.row, .cols = winsize.col };
-    } else {
-        std.log.debug("failed to determine terminal size; using conservative guess 80x25", .{});
-        return TerminalSize{ .rows = 50, .cols = 50 };
-    }
+    if (err < 0 or winsize.row == 0 or winsize.col == 0) return null;
+    return TerminalSize{ .rows = winsize.row, .cols = winsize.col };
 }
 
 const TerminalPosition = struct { col: u64, row: u64 };
@@ -302,10 +305,21 @@ fn countLiveCells(x: usize, y: usize, gameBoard: [][]u8) u64 {
     return live_cells;
 }
 
-test "determine dimensions returns a square (Assumes 2:1 aspect ratio of height to width)" {
-    const dims = try determineGameBoardDimensions(std.testing.io);
-    try std.testing.expect(dims.x * 2 == dims.y);
-    try std.testing.expect(dims.x > 0);
+test "determine dimensions returns largest visually square board" {
+    const dims = try determineGameBoardDimensionsForTerminalSize(.{ .cols = 80, .rows = 25 });
+    try std.testing.expectEqual(@as(u64, 42), dims.x);
+    try std.testing.expectEqual(@as(u64, 21), dims.y);
+    try std.testing.expectEqual(dims.y * 2, dims.x);
+}
+
+test "determine dimensions is limited by terminal columns" {
+    const dims = try determineGameBoardDimensionsForTerminalSize(.{ .cols = 30, .rows = 100 });
+    try std.testing.expectEqual(@as(u64, 28), dims.x);
+    try std.testing.expectEqual(@as(u64, 14), dims.y);
+}
+
+test "determine dimensions rejects terminals too small for borders and stats" {
+    try std.testing.expectError(RuntimeError.TerminalTooSmall, determineGameBoardDimensionsForTerminalSize(.{ .cols = 21, .rows = 13 }));
 }
 
 test "parse SGR mouse click" {

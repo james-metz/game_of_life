@@ -51,6 +51,6 @@ pub fn main(init: std.process.Init) !void {
         game_of_life.evolveState(current_game_board, next_game_board);
 
         try game_of_life.writeFrame(init.io, current_game_board);
-        try init.io.sleep(std.Io.Duration.fromNanoseconds(10), std.Io.Clock.awake);
+        try init.io.sleep(std.Io.Duration.fromMilliseconds(100), std.Io.Clock.awake);
     }
 }
